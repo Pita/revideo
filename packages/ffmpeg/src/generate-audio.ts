@@ -180,27 +180,90 @@ async function mergeAudioTracks(
   tempDir: string,
   audioFilenames: string[],
 ): Promise<void> {
+  ffmpeg.setFfmpegPath(ffmpegSettings.getFfmpegPath());
+
+  const batches = createConcatBatches(audioFilenames);
+  const finalOutputPath = path.join(tempDir, 'audio.wav');
+
+  if (batches.length === 1) {
+    // If there's only one batch, merge directly to the final output
+    await mergeAudio(batches[0], finalOutputPath);
+  } else {
+    // Process batches serially and create temporary files
+    const tempFiles: string[] = [];
+    for (let i = 0; i < batches.length; i++) {
+      console.log(`Merging batch ${i + 1} of ${batches.length}`);
+      const tempOutputPath = path.join(tempDir, `temp_${i}.wav`);
+      await mergeAudio(batches[i], tempOutputPath);
+      tempFiles.push(tempOutputPath);
+    }
+
+    // Merge temporary files
+    await mergeAudio(tempFiles, finalOutputPath);
+
+    // Clean up temporary files
+    tempFiles.forEach(file => fs.unlinkSync(file));
+  }
+}
+
+const MAX_BATCH_SIZE = 1024 * 1024 * 1024; // 1GB
+const MIN_FILES_PER_BATCH = 2;
+
+function createConcatBatches(filePaths: string[]): string[][] {
+  const batches: string[][] = [];
+  let currentBatch: string[] = [];
+  let currentBatchSize = 0;
+
+  for (const filePath of filePaths) {
+    const fileSize = fs.statSync(filePath).size;
+
+    if (
+      currentBatch.length >= MIN_FILES_PER_BATCH &&
+      currentBatchSize + fileSize > MAX_BATCH_SIZE
+    ) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBatchSize = 0;
+    }
+    currentBatch.push(filePath);
+    currentBatchSize += fileSize;
+  }
+
+  // Handle the last batch
+  if (currentBatch.length > 0) {
+    if (currentBatch.length < MIN_FILES_PER_BATCH && batches.length > 0) {
+      // If the last batch is too small, merge it with the previous batch
+      batches[batches.length - 1].push(...currentBatch);
+    } else {
+      batches.push(currentBatch);
+    }
+  }
+
+  return batches;
+}
+
+async function mergeAudio(
+  inputFiles: string[],
+  outputPath: string,
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    ffmpeg.setFfmpegPath(ffmpegSettings.getFfmpegPath());
     const command = ffmpeg();
 
-    audioFilenames.forEach(filename => {
+    inputFiles.forEach(filename => {
       command.input(filename);
     });
 
     command
       .complexFilter([
-        `amix=inputs=${audioFilenames.length}:duration=longest,volume=${audioFilenames.length}`,
+        `amix=inputs=${inputFiles.length}:duration=longest,volume=${inputFiles.length}`,
       ])
       .outputOptions(['-c:a', 'pcm_s16le'])
-      .on('end', () => {
-        resolve();
-      })
+      .on('end', () => resolve(outputPath))
       .on('error', err => {
-        console.error(`Error merging audio tracks: ${err.message}`);
+        console.error(`Error merging audio: ${err.message}`);
         reject(err);
       })
-      .save(path.join(tempDir, `audio.wav`));
+      .save(outputPath);
   });
 }
 
